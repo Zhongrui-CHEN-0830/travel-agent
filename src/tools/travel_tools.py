@@ -11,7 +11,16 @@ from coze_coding_utils.runtime_ctx.context import new_context
 from coze_coding_utils.log.write_log import request_context
 from langchain_core.messages import HumanMessage, SystemMessage
 
+try:
+    from json_repair import repair_json
+    HAS_JSON_REPAIR = True
+except ImportError:
+    HAS_JSON_REPAIR = False
+    repair_json = None
+
 logger = logging.getLogger(__name__)
+
+FONT_PATH = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
 
 FONT_PATH = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
 
@@ -71,31 +80,61 @@ def _fix_common_json_errors(text: str) -> str:
 
 
 def _safe_json_loads(text: str) -> dict:
-    """安全解析JSON，尝试修复常见错误"""
+    """安全解析JSON，尝试修复常见错误，支持多级降级修复"""
+    # 级别1: 直接解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # 尝试修复
-        fixed = _fix_common_json_errors(text)
+        pass
+
+    # 级别2: 修复常见格式错误
+    fixed = _fix_common_json_errors(text)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # 级别3: 尝试找到最后一个完整的JSON对象（处理尾部多余文本）
+    brace_count = 0
+    last_valid_end = 0
+    for i, ch in enumerate(text):
+        if ch == "{":
+            brace_count += 1
+        elif ch == "}":
+            brace_count -= 1
+            if brace_count == 0:
+                last_valid_end = i + 1
+    if last_valid_end > 0:
+        truncated = text[:last_valid_end]
+        fixed = _fix_common_json_errors(truncated)
         try:
             return json.loads(fixed)
         except json.JSONDecodeError:
-            # 尝试找到最后一个完整的JSON对象
-            # 有时LLM会在JSON后添加额外文本
-            brace_count = 0
-            last_valid_end = 0
-            for i, ch in enumerate(text):
-                if ch == "{":
-                    brace_count += 1
-                elif ch == "}":
-                    brace_count -= 1
-                    if brace_count == 0:
-                        last_valid_end = i + 1
-            if last_valid_end > 0:
-                truncated = text[:last_valid_end]
-                fixed = _fix_common_json_errors(truncated)
-                return json.loads(fixed)
-            raise
+            pass
+
+    # 级别4: 使用 json_repair 库进行深度修复
+    if HAS_JSON_REPAIR and repair_json is not None:
+        try:
+            repaired = repair_json(text)
+            if isinstance(repaired, dict):
+                return repaired
+            if isinstance(repaired, str):
+                return json.loads(repaired)
+        except Exception:
+            pass
+
+    # 级别5: 再次尝试用 json_repair 修复截断后的文本
+    if HAS_JSON_REPAIR and repair_json is not None and last_valid_end > 0:
+        try:
+            repaired = repair_json(text[:last_valid_end])
+            if isinstance(repaired, dict):
+                return repaired
+            if isinstance(repaired, str):
+                return json.loads(repaired)
+        except Exception:
+            pass
+
+    raise json.JSONDecodeError("无法解析JSON，所有修复策略均失败", text, 0)
 
 
 def _load_font(size: int):
@@ -131,21 +170,28 @@ def _calculate_budget_core(itinerary: dict) -> dict:
 
     days = itinerary.get("days", itinerary.get("itinerary", []))
     for day in days:
-        for spot in day.get("spots", []):
-            price = spot.get("price", 0) or 0
+        # 兼容多种景点字段名
+        spots = day.get("spots", day.get("attractions", day.get("places", [])))
+        for spot in spots:
+            price = spot.get("price", spot.get("ticket_price", spot.get("ticket", 0))) or 0
             budget_detail["门票费用"] += price * travelers
 
-        for meal in day.get("meals", []):
-            price = meal.get("price", 0) or 0
-            budget_detail["餐饮费用"] += price * travelers
+        # 兼容多种餐饮字段名
+        meals = day.get("meals", day.get("food", day.get("dining", [])))
+        for meal in meals:
+            if isinstance(meal, dict):
+                price = meal.get("price", meal.get("total_price", 0)) or 0
+                budget_detail["餐饮费用"] += price
 
-        hotel = day.get("hotel", {})
+        # 兼容多种住宿字段名
+        hotel = day.get("hotel", day.get("accommodation", day.get("lodging", {})))
         if hotel and isinstance(hotel, dict):
-            budget_detail["住宿费用"] += hotel.get("price", 0) or 0
+            budget_detail["住宿费用"] += hotel.get("price", hotel.get("cost", 0)) or 0
 
-        transport = day.get("transport", {})
+        # 兼容多种交通字段名
+        transport = day.get("transport", day.get("transportation", {}))
         if transport and isinstance(transport, dict):
-            budget_detail["交通费用"] += transport.get("cost", 0) or 0
+            budget_detail["交通费用"] += transport.get("cost", transport.get("price", 0)) or 0
 
     total = sum(budget_detail.values())
     per_person = total / travelers if travelers > 0 else total
@@ -201,30 +247,35 @@ def _build_itinerary_markdown(itinerary: dict, include_budget: bool = True) -> s
     for day in days:
         md += f"\n### 第{day.get('day', '')}天 ({day.get('date', '')})\n\n"
 
-        if day.get("spots"):
+        spots = day.get("spots", day.get("attractions", day.get("places", [])))
+        if spots:
             md += "**景点安排：**\n\n"
-            for spot in day.get("spots", []):
+            for spot in spots:
                 md += f"- **{spot.get('name', '')}** ({spot.get('duration', '')}) - {spot.get('description', '')}\n"
-                md += f"  - 门票：{spot.get('price', 0)}元 | 地址：{spot.get('address', '')}\n\n"
+                md += f"  - 门票：{spot.get('price', spot.get('ticket_price', 0))}元 | 地址：{spot.get('address', '')}\n\n"
 
-        if day.get("meals"):
+        meals = day.get("meals", day.get("food", day.get("dining", [])))
+        if meals:
             md += "**餐饮推荐：**\n\n"
-            for meal in day.get("meals", []):
-                md += f"- {meal.get('type', '')}：{meal.get('recommendation', '')}（约{meal.get('price', 0)}元/人）\n"
+            for meal in meals:
+                if isinstance(meal, dict):
+                    md += f"- {meal.get('type', meal.get('meal', ''))}：{meal.get('recommendation', meal.get('name', ''))}（约{meal.get('price', 0)}元/人）\n"
+                else:
+                    md += f"- {meal}\n"
             md += "\n"
 
-        hotel = day.get("hotel")
+        hotel = day.get("hotel", day.get("accommodation", day.get("lodging")))
         if hotel:
             if isinstance(hotel, dict):
-                md += f"**住宿**：{hotel.get('name', '')}（约{hotel.get('price', 0)}元/晚）\n"
+                md += f"**住宿**：{hotel.get('name', '')}（约{hotel.get('price', hotel.get('cost', 0))}元/晚）\n"
                 md += f"- 地址：{hotel.get('address', '')}\n\n"
             else:
                 md += f"**住宿**：{hotel}\n\n"
 
-        transport = day.get("transport")
+        transport = day.get("transport", day.get("transportation"))
         if transport:
             if isinstance(transport, dict):
-                md += f"**交通**：{transport.get('description', '')}（约{transport.get('cost', 0)}元）\n\n"
+                md += f"**交通**：{transport.get('description', '')}（约{transport.get('cost', transport.get('price', 0))}元）\n\n"
             else:
                 md += f"**交通**：{transport}\n\n"
 
@@ -331,49 +382,47 @@ def plan_itinerary(
         system_prompt = """你是一位资深的旅行规划师，擅长为用户制定详细实用的旅行行程。
 请根据用户提供的信息，生成一份完整的行程计划JSON。
 
-要求：
-1. 必须输出合法的JSON格式，不要包含Markdown代码块标记
-2. 每天包含：日期、景点安排（上午/下午/晚上）、餐饮推荐、住宿信息
-3. 每个景点包含：名称、类型(attraction/food/hotel)、描述、建议游览时长、参考门票价格（人民币数字）、详细地址、经纬度坐标
-4. 经纬度请根据实际地理位置填写合理的大致坐标（保留6位小数）
-5. 包含交通建议和旅行注意事项
-6. 餐饮推荐包含每餐的价格参考
-7. 住宿包含酒店名称和价格
+【严格要求 - 必须遵守】
+1. 输出必须是合法、完整的JSON格式
+2. 不要添加任何Markdown代码块标记（如 ```json）
+3. 不要添加任何解释说明文字，只输出纯JSON
+4. 所有字符串值必须使用双引号包裹
+5. 对象和数组末尾不要有多余的逗号
+6. 确保大括号和中括号完全匹配闭合
 
-JSON结构示例：
+【字段命名强制规范 - 必须使用以下字段名，不可替换】
+- 每天的景点列表字段名必须是 "spots"（不是attractions/places）
+- 每天的餐饮列表字段名必须是 "meals"（不是food/dining）
+- 每天的住宿字段名必须是 "hotel"
+- 每天的交通字段名必须是 "transport"
+- 每个景点的时长字段名必须是 "duration"（字符串，如"2小时"）
+- 每个景点的价格字段名必须是 "price"（数字，单位元）
+- 每个景点的纬度字段名必须是 "latitude"（数字）
+- 每个景点的经度字段名必须是 "longitude"（数字）
+
+【JSON结构示例】
 {
-  "destination": "目的地",
-  "start_date": "2024-06-01",
-  "end_date": "2024-06-03",
+  "destination": "城市名",
+  "start_date": "2025-01-01",
+  "end_date": "2025-01-03",
   "travelers": 2,
-  "total_budget": 5000,
-  "preferences": "偏好",
+  "total_budget": 3000,
+  "preferences": "偏好描述",
   "days": [
     {
       "day": 1,
-      "date": "2024-06-01",
+      "date": "2025-01-01",
       "spots": [
-        {
-          "name": "景点名",
-          "type": "attraction",
-          "description": "景点描述",
-          "duration": "2小时",
-          "price": 100,
-          "address": "详细地址",
-          "latitude": 39.904200,
-          "longitude": 116.407400
-        }
+        {"name": "景点名", "type": "attraction", "description": "...", "duration": "2小时", "price": 50, "address": "...", "latitude": 30.123456, "longitude": 120.123456}
       ],
       "meals": [
-        {"type": "早餐", "recommendation": "推荐餐厅", "price": 30},
-        {"type": "午餐", "recommendation": "推荐餐厅", "price": 60},
-        {"type": "晚餐", "recommendation": "推荐餐厅", "price": 80}
+        {"type": "早餐", "recommendation": "推荐餐厅", "price": 30}
       ],
-      "hotel": {"name": "酒店名", "price": 400, "address": "酒店地址"},
-      "transport": {"description": "当天交通方式", "cost": 50}
+      "hotel": {"name": "酒店名", "price": 400, "address": "..."},
+      "transport": {"description": "交通方式", "cost": 20}
     }
   ],
-  "tips": ["注意事项1", "注意事项2"]
+  "tips": ["提示1", "提示2"]
 }"""
 
         user_prompt = f"""请为以下旅行需求制定详细行程：
@@ -385,7 +434,7 @@ JSON结构示例：
 预算范围：{budget or '中等预算'}
 {search_info}
 
-请直接输出JSON格式的行程计划，不要添加任何解释说明。"""
+【重要】请直接输出纯JSON，不要添加任何其他文字或格式标记。确保JSON语法100%正确。"""
 
         llm_client = LLMClient(ctx=ctx)
         messages = [
@@ -393,17 +442,49 @@ JSON结构示例：
             HumanMessage(content=user_prompt),
         ]
 
+        # 第一次尝试
         response = llm_client.invoke(
             messages=messages,
             model="doubao-seed-2-0-lite-260215",
-            temperature=0.7,
+            temperature=0.3,
             max_completion_tokens=8192,
         )
 
-        content = _extract_json_from_text(_get_text_content(response.content))
+        raw_text = _get_text_content(response.content)
+        content = _extract_json_from_text(raw_text)
 
-        # 安全解析JSON（自动修复常见格式错误）
-        itinerary = _safe_json_loads(content)
+        # 尝试解析
+        try:
+            itinerary = _safe_json_loads(content)
+        except json.JSONDecodeError as e1:
+            logger.warning(f"plan_itinerary first parse failed: {e1}, retrying...")
+            # 第二次尝试：用更低温度重试，强调JSON格式
+            messages.append(
+                HumanMessage(
+                    content="上一次的输出存在JSON格式错误，请重新输出一份语法完全正确的纯JSON行程计划，不要添加任何解释文字。"
+                )
+            )
+            response2 = llm_client.invoke(
+                messages=messages,
+                model="doubao-seed-2-0-lite-260215",
+                temperature=0.1,
+                max_completion_tokens=8192,
+            )
+            raw_text2 = _get_text_content(response2.content)
+            content = _extract_json_from_text(raw_text2)
+            try:
+                itinerary = _safe_json_loads(content)
+            except json.JSONDecodeError as e2:
+                logger.error(
+                    f"plan_itinerary retry parse failed: {e2}, content: {content[:800]}"
+                )
+                return json.dumps(
+                    {
+                        "error": f"行程JSON解析失败，请重新描述需求后重试",
+                        "detail": str(e2),
+                    },
+                    ensure_ascii=False,
+                )
 
         # 确保基本字段存在
         itinerary.setdefault("destination", destination)
@@ -415,12 +496,6 @@ JSON结构示例：
         itinerary.setdefault("tips", [])
 
         return json.dumps(itinerary, ensure_ascii=False, indent=2)
-    except json.JSONDecodeError as e:
-        logger.error(f"plan_itinerary JSON parse error: {e}, content: {content[:500]}")
-        return json.dumps(
-            {"error": f"行程JSON解析失败: {str(e)}", "message": "请稍后重试"},
-            ensure_ascii=False,
-        )
     except Exception as e:
         logger.error(f"plan_itinerary error: {e}")
         return json.dumps(
@@ -434,7 +509,7 @@ def calculate_budget(itinerary_json: str) -> str:
     """计算并统计行程中的门票、酒店、餐饮、交通等各项费用，生成详细预算明细。
 
     Args:
-        itinerary_json: 行程计划的JSON字符串
+        itinerary_json: 行程计划的JSON字符串。你应该从之前 plan_itinerary 的返回结果或对话上下文中直接获取，绝不要求用户手动提供。
     """
     try:
         itinerary = json.loads(itinerary_json)
@@ -459,7 +534,7 @@ def edit_itinerary(
     """编辑行程，支持添加、删除或调整景点顺序。
 
     Args:
-        itinerary_json: 当前行程的JSON字符串
+        itinerary_json: 当前行程的JSON字符串。你应该从之前 plan_itinerary 的返回结果或对话上下文中直接获取，绝不要求用户手动提供。
         operation: 操作类型：add(添加景点)、remove(删除景点)、reorder(调整顺序)、update(修改景点)
         day_index: 目标天数索引（从1开始）
         spot_info: 操作相关的景点信息JSON字符串。add时为新景点对象；remove时为{"name":"景点名"}；reorder时为{"order":["景点A","景点B"]}；update时为完整景点对象
@@ -666,7 +741,7 @@ def _generate_pillow_map(all_spots, days_to_show, destination, day_index):
     day_groups = {}
     for lon, lat, name, color in all_spots:
         for d_idx, day in enumerate(days_to_show):
-            for spot in day.get("spots", []):
+            for spot in day.get("spots", day.get("attractions", day.get("places", []))):
                 slat, slon = _get_coords(spot)
                 if slat is not None and slon is not None:
                     if abs(slat - lat) < 0.0001 and abs(slon - lon) < 0.0001:
@@ -743,7 +818,7 @@ def visualize_map(itinerary_json: str, day_index: int = 0) -> str:
     """在地图上标注行程的景点位置，并绘制游览路线，生成地图图片。
 
     Args:
-        itinerary_json: 行程计划的JSON字符串
+        itinerary_json: 行程计划的JSON字符串。你应该从之前 plan_itinerary 的返回结果或对话上下文中直接获取，绝不要求用户手动提供。
         day_index: 指定天数（从1开始），0表示全部天数
     """
     try:
@@ -775,7 +850,7 @@ def visualize_map(itinerary_json: str, day_index: int = 0) -> str:
 
         for d_idx, day in enumerate(days_to_show):
             color = colors[d_idx % len(colors)]
-            day_spots = day.get("spots", [])
+            day_spots = day.get("spots", day.get("attractions", day.get("places", [])))
             for spot in day_spots:
                 lat, lon = _get_coords(spot)
                 if lat is not None and lon is not None:
@@ -825,7 +900,7 @@ def export_itinerary(itinerary_json: str, export_format: str = "pdf") -> str:
     """将规划的行程导出为PDF或图片格式，便于保存和分享。
 
     Args:
-        itinerary_json: 行程计划的JSON字符串
+        itinerary_json: 行程计划的JSON字符串。你应该从之前 plan_itinerary 的返回结果或对话上下文中直接获取，绝不要求用户手动提供。
         export_format: 导出格式，可选 pdf 或 image
     """
     ctx = _get_ctx()

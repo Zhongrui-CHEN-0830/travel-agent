@@ -42,6 +42,7 @@ dependencies = [
     "folium>=0.20.0",
     "geopy>=2.4.1",
     "staticmap>=0.5.7",
+    "json-repair>=0.59.10",
 ]
 
 [tool.uv]
